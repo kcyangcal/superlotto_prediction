@@ -1,3 +1,25 @@
+# ── 專案自訂規則（SuperLotto Prediction）─────────────────────────────────────
+# 資料庫檔案（含個人資料，不納入版控）
+# 用 *.db 通配符涵蓋備份、測試用的同類檔案（如 backup.db、test.db）
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/exports/
+
+# 訓練好的模型存檔（檔案通常很大）
+data/models/
+*.pkl
+*.joblib
+
+# Claude Code 本地設定（含個人化設定，不應提交）
+.claude/
+
+# Jupyter Notebook 輸出（cell output 可能含有資料庫查詢結果）
+# 提交前請先執行 jupyter nbconvert --clear-output 清除輸出
+notebooks/*.ipynb
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
