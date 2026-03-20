@@ -133,7 +133,7 @@ class LotteryApiClient:
 
         data = response.json()
         draw_count = len(data.get("PreviousDraws", []))
-        total = data.get("TotalDrawCount", "未知")
+        total = data.get("TotalPreviousDraws", "未知")
         logger.debug(f"第 {page} 頁：取得 {draw_count} 筆，總計 {total} 筆")
 
         return data
@@ -146,7 +146,7 @@ class LotteryApiClient:
             int: 總開獎期數
         """
         data = self.fetch_page(page=1)
-        return data.get("TotalDrawCount", 0)
+        return data.get("TotalPreviousDraws", 0)
 
     def close(self):
         """釋放 HTTP Session 資源（長時間執行的程式應該在結束時呼叫）"""

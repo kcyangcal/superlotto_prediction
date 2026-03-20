@@ -144,14 +144,23 @@ def parse_prizes(raw: dict) -> list[dict]:
     draw_number = int(raw["DrawNumber"])
     prizes = []
 
-    prize_list = raw.get("PrizePayoutDetails") or raw.get("Prizes") or []
-    for prize in prize_list:
+    # API 回傳的 Prizes 是 dict of dicts：{"1": {PrizeTypeDescription, Count, Amount}, ...}
+    # 而不是 list，需要取 .values() 迭代
+    raw_prizes = raw.get("Prizes") or raw.get("PrizePayoutDetails") or {}
+    if isinstance(raw_prizes, dict):
+        prize_items = raw_prizes.values()
+    else:
+        prize_items = raw_prizes  # 相容 list 格式（PrizePayoutDetails）
+
+    for prize in prize_items:
+        if not isinstance(prize, dict):
+            continue
         try:
             prizes.append({
                 "draw_number":       draw_number,
-                "prize_description": str(prize.get("PrizeDescription", "")),
-                "winner_count":      _safe_int(prize.get("NumberOfWinners")),
-                "prize_amount":      _safe_float(prize.get("PrizeAmount")),
+                "prize_description": str(prize.get("PrizeTypeDescription") or prize.get("PrizeDescription", "")),
+                "winner_count":      _safe_int(prize.get("Count") or prize.get("NumberOfWinners")),
+                "prize_amount":      _safe_float(prize.get("Amount") or prize.get("PrizeAmount")),
             })
         except Exception as e:
             logger.warning(f"期號 {draw_number}：獎項解析失敗：{e}，略過此獎項")

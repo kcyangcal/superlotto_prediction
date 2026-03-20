@@ -45,7 +45,7 @@ def scrape_all(
 
     # 先抓第 1 頁，取得總資料筆數，計算總頁數
     first_page = client.fetch_page(page=1)
-    total_draws = first_page.get("TotalDrawCount", 0)
+    total_draws = first_page.get("TotalPreviousDraws", 0)
     total_pages = math.ceil(total_draws / page_size)
     logger.info(f"  總計 {total_draws} 筆資料，分 {total_pages} 頁（每頁 {page_size} 筆）")
 

@@ -22,10 +22,10 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 # 官方公開的 JSON API，無需登入或 API key
 API_BASE_URL  = "https://www.calottery.com/api/DrawGameApi/DrawGamePastDrawResults"
 GAME_ID       = 8      # SuperLotto Plus 的遊戲 ID（可至官網確認）
-PAGE_SIZE     = 100    # 每頁資料筆數（建議 100，避免請求過大）
+PAGE_SIZE     = 50     # 每頁資料筆數（API 最大支援 50，超過會回傳 null）
 
 # 爬蟲禮儀設定
-REQUEST_DELAY   = 1.5  # 每次 HTTP 請求之間的等待秒數（避免觸發速率限制）
+REQUEST_DELAY   = 3.0  # 每次 HTTP 請求之間的等待秒數（避免觸發速率限制）
 REQUEST_TIMEOUT = 30   # 單次請求的逾時秒數
 
 # ── SuperLotto Plus 號碼規則 ────────────────────────────────────────────────

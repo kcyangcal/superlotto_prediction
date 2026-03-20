@@ -1,3 +1,4 @@
+# Python 3.12 環境
 # ── 網路抓取 ──────────────────────────────────────────────────────────────────
 requests==2.32.3        # HTTP 客戶端，含 Session 與 Retry 機制
 beautifulsoup4==4.12.3  # HTML 解析器（教學用 fallback，主要爬蟲使用 requests JSON API）
