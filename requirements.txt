@@ -24,6 +24,6 @@ ipykernel==6.29.5       # Jupyter 的 Python kernel
 pytest==8.3.3           # 單元測試框架
 python-dotenv==1.0.1    # 環境變數管理（若未來需要 API key 等敏感資訊）
 
-# ── 選用：深度學習 (LSTM 模型) ────────────────────────────────────────────────
-# 若要實作 L3 LSTM 模型，請解除以下註解後重新執行 pip install -r requirements.txt
-# torch==2.4.0           # PyTorch（LSTM 時序模型）
+# ── 深度學習 (MLP + LSTM 神經網路) ──────────────────────────────────────────────
+torch>=2.0.0            # PyTorch（MLP + LSTM 時序模型）
+scipy>=1.13.0           # 統計檢定（t-test）
