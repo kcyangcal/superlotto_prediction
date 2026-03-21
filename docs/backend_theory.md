@@ -591,17 +591,40 @@ partial_fit(new_draws, epochs=5)
 
 ### 3.2 Rolling 評估的設計差異
 
-```
-逐期 Rolling（run_rolling_nn.py）：
-  最嚴謹。每期更新後立即評估下一期。
-  模型：每期都看到所有歷史資料，預測次期，記錄命中。
-  適用：比較模型在持續學習場景下的穩定性。
+兩個評估腳本均採用 **Per-Draw 滾動預測**，差異在於評估範圍：
 
-Fold 級評估（run_evaluation.py）：
-  效率優先。每 Fold 訓練一次，評估整個測試視窗。
-  缺點：測試視窗內模型不更新（靜態假設）。
-  適用：快速比較多個模型的整體能力。
 ```
+run_evaluation.py（Fold 級彙整）：
+  ┌ 每 Fold 內部 ─────────────────────────────────────────────┐
+  │  cumulative = train_df                                      │
+  │  for each draw in test window:                              │
+  │    ① fit(cumulative)  ← 每期重訓                           │
+  │    ② predict()        ← 不看本期開獎                       │
+  │    ③ record hits + prize EV                                │
+  │    ④ cumulative += this draw                               │
+  └────────────────────────────────────────────────────────────┘
+  優點：快（Markov/Bayesian 重訓 <1ms/期）；缺點：不支援 NN
+
+run_rolling_nn.py（全資料滾動）：
+  ┌ 全測試集逐期 ─────────────────────────────────────────────┐
+  │  for each draw in ALL test draws:                           │
+  │    ① full retrain (every N draws) or partial_fit           │
+  │    ② predict                                               │
+  │    ③ record hits + prize EV                               │
+  │    ④ model state preserved between draws                  │
+  └────────────────────────────────────────────────────────────┘
+  優點：支援 NN 增量學習；缺點：NN 需設 retrain_every=10~20
+```
+
+### 3.3 EV 期望值欄位說明
+
+自 2026-03-20 起，兩個評估腳本均輸出以下 EV 欄位：
+
+| 欄位       | 計算方式                                         |
+|------------|--------------------------------------------------|
+| EV/期      | mean(每期實際獎金)（若模型無 Mega 預測，用期望值）  |
+| 淨 EV      | EV/期 − $1.00（票價）                            |
+| ROI%       | 淨 EV / $1.00 × 100%（永遠為負，莊家優勢）       |
 
 ---
 

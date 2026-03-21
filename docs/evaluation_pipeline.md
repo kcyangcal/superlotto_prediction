@@ -135,16 +135,118 @@ H₁: 模型的平均命中數 > 0.532
 
 ---
 
-## 4. 評估模組架構
+## 4. Per-Draw 滾動預測（正確評估方法）
+
+### 4.1 為什麼「每 Fold 訓練一次」是錯的
+
+舊版 `run_evaluation.py` 的問題：
+
+```python
+# ❌ 舊版錯誤做法
+model.fit(train_df)
+prediction = model.predict()
+# 用同一組 5 球對該 Fold 所有 52 期做比較
+for row in test_df.iterrows():
+    hits = hit_at_k(prediction, row)   # 模型從未更新！
+```
+
+問題：測試視窗內的第 2 期、第 3 期… 已知的開獎結果沒有被納入訓練。
+這相當於假設「模型在測試期間永遠不學習新資料」，不符合真實使用場景。
+
+### 4.2 正確的 Per-Draw 滾動評估
+
+```python
+# ✅ 正確做法：每期預測前，用截至上一期的完整歷史訓練
+cumulative = train_df.copy()
+
+for draw_i, (_, row) in enumerate(test_df.iterrows()):
+    actual_balls = [int(row[c]) for c in WHITE_COLS]
+
+    # ① 以截至上一期的全部歷史訓練（不含本期）
+    model = build_model(model_name)
+    model.fit(cumulative)
+
+    # ② 預測（此時模型看不到本期開獎）
+    prediction = model.predict(n_white=5)
+    predicted_balls = prediction.get("white_balls", [])
+
+    # ③ 記錄命中數與獎金 EV（此時才「揭曉」本期開獎）
+    fold_metric.add(predicted_balls, actual_balls, predicted_mega, actual_mega)
+
+    # ④ 把本期實際開獎加入累積訓練資料，供下一期使用
+    cumulative = pd.concat([cumulative, test_df.iloc[[draw_i]]], ignore_index=True)
+```
+
+**速度**：Bayesian/Markov/Frequency 每次重訓 1–10ms，52 期 × 8 Fold 合計 < 10 秒。
+
+---
+
+## 5. 獎金期望值（EV）計算
+
+### 5.1 SuperLotto Plus 獎金結構
+
+以下為實際某期開獎的 Pari-Mutuel 獎金（每期依銷售量和中獎人數浮動）：
+
+| 命中組合     | 獎金          |
+|-------------|---------------|
+| 5 + Mega    | $7,000,000    |
+| 5           | $25,241       |
+| 4 + Mega    | $1,402        |
+| 4           | $108          |
+| 3 + Mega    | $61           |
+| 3           | $11           |
+| 2 + Mega    | $12           |
+| 1 + Mega    | $2            |
+| 0 + Mega    | $1            |
+
+票價：$1.00
+
+### 5.2 EV 計算邏輯
+
+```python
+TICKET_COST = 1.0
+
+# 當模型有預測 Mega 球時：
+mega_hit = (predicted_mega == actual_mega)
+prize = PRIZE_TABLE[(white_hits, mega_hit)]
+
+# 當模型未預測 Mega 球時（多數模型）：
+# 假設隨機猜 1/27 機率命中 Mega，計算期望獎金
+prize = (1/27) * PRIZE_TABLE[(hits, True)] + (26/27) * PRIZE_TABLE[(hits, False)]
+
+# 每期淨 EV
+net_ev = prize - TICKET_COST
+```
+
+### 5.3 實際評估結果（2020-2025，per-draw 滾動）
+
+```
+模型           │ Avg Hits │ Prec@5  │ vs Rnd  │  EV/期  │   淨EV  │  ROI%
+───────────────┼──────────┼─────────┼─────────┼─────────┼─────────┼────────
+markov         │   0.583  │ 11.66%  │ +0.051  │ $0.1508 │ $-0.849 │ -84.9%
+frequency      │   0.570  │ 11.41%  │ +0.039  │ $0.3521 │ $-0.648 │ -64.8%
+bayesian       │   0.491  │  9.82%  │ -0.041  │ $0.1037 │ $-0.896 │ -89.6%
+隨機基準       │   0.532  │ 10.64%  │  0.000  │    —    │    —    │    —
+```
+
+**結論**：
+- 所有模型的 p-value > 0.05（未顯著優於隨機基準）
+- 淨 EV 全為負值（每注平均虧損 $0.65 ~ $0.90），這是彩票內建的莊家優勢
+- `frequency` 的 EV 相對較高是因為特定 Fold 碰到 3 中（$11）的情況
+
+---
+
+## 6. 評估模組架構
 
 ```
 src/evaluation/
 ├── __init__.py
 ├── walk_forward.py     # WalkForwardSplit 類別：產生 Fold 的訓練/測試資料對
-└── metrics.py          # FoldMetrics, aggregate_fold_results, print_fold_report
+└── metrics.py          # FoldMetrics, PRIZE_TABLE, calc_prize, EV 計算
 
 scripts/
-└── run_evaluation.py   # 執行腳本：整合所有模型的 Walk-Forward 評估
+├── run_evaluation.py   # Walk-Forward 評估（per-draw 滾動，適合快速模型）
+└── run_rolling_nn.py   # 逐期滾動評估（含 MLP/LSTM，適合神經網路）
 ```
 
 ### 核心類別
@@ -158,53 +260,57 @@ scripts/
 
 **`FoldMetrics`**（`metrics.py`）
 
-| 方法                                     | 說明                        |
-|------------------------------------------|-----------------------------|
-| `add(predicted, actual, prob_scores)`    | 登記一期的評估結果           |
-| `summary()`                              | 回傳本 Fold 的彙整指標字典   |
+| 方法                                                       | 說明                        |
+|------------------------------------------------------------|-----------------------------|
+| `add(predicted, actual, predicted_mega, actual_mega, k=5)` | 登記一期，自動計算獎金 EV   |
+| `summary()`                                                | 回傳 Fold 彙整：命中/EV/ROI |
 
 ---
 
-## 5. 執行方式
+## 7. 執行方式
 
 ```bash
-# 快速測試（只用 3 個快速模型，3 個月測試視窗）
-python scripts/run_evaluation.py \
+# 快速測試（3 個快速模型，3 個月測試視窗，含 EV 輸出）
+PYTHONIOENCODING=utf-8 python scripts/run_evaluation.py \
   --train-months 18 \
   --test-months 3 \
   --models frequency,markov,bayesian \
   --show-folds
 
-# 完整評估
-python scripts/run_evaluation.py \
+# 完整評估（含 Fold 詳細命中分布）
+PYTHONIOENCODING=utf-8 python scripts/run_evaluation.py \
   --train-months 24 \
   --test-months 6 \
   --models frequency,montecarlo,markov,bayesian
+
+# 神經網路 + 全模型逐期 Rolling 評估
+PYTHONIOENCODING=utf-8 python scripts/run_rolling_nn.py \
+  --test-draws 200 \
+  --models mlp,lstm,bayesian,markov,frequency
 ```
 
-### 輸出範例
+> **Windows 注意**：加上 `PYTHONIOENCODING=utf-8` 避免中文字符在 cp950 終端顯示亂碼。
+
+### 輸出範例（2026-03-20 實際執行結果）
 
 ```
 ══════════════════════════════════════════════════════════════
- Walk-Forward 切分預覽
+ Walk-Forward 切分預覽（train=18m, test=3m, 共 18 Folds）
 ══════════════════════════════════════════════════════════════
  fold  train_start  train_end   test_start  test_end    n_train  n_test
-    1   2020-01-01  2021-12-31  2022-01-01  2022-06-30     208      52
-    2   2020-01-01  2022-06-30  2022-07-01  2022-12-31     260      53
+    1   2020-01-01  2021-06-30  2021-07-03  2021-09-29     157      26
     ...
+   18   2020-01-01  2025-09-27  2025-10-01  2025-12-31     600      27
 
-══════════════════════════════════════════════════════════════
- 模型：bayesian — Walk-Forward 評估
-══════════════════════════════════════════════════════════════
-Fold │ 訓練集終點   測試集範圍                │ n_test │ Avg Hits │ Prec@5
-─────┼──────────────────────────────────────────────────────────────────
-   1 │ 2021-12-31   2022-01-01 → 2022-06-30 │     52 │    0.558 │ 11.15%
-   2 │ 2022-06-30   2022-07-01 → 2022-12-31 │     53 │    0.528 │ 10.57%
-...
-─────────────────────────────────────────────────────────────
-  整體平均命中：0.543 ± 0.018  （隨機基準：0.532）
-  整體 Prec@5 ：10.86%         （隨機基準：10.64%）
-  統計檢定    ：t=1.234, p=0.2187 — 未顯著優於隨機
+══════════════════════════════════════════════════════════════════════════════════════
+ 各模型 Walk-Forward 評估結果總覽
+══════════════════════════════════════════════════════════════════════════════════════
+模型           │ Avg Hits │ Prec@5  │ vs Rnd  │  EV/期   │   淨EV   │  ROI%  │ p-val
+───────────────────────────────────────────────────────────────────────────────────
+markov         │   0.583  │ 11.66%  │ +0.051  │ $0.1508  │ $-0.8492 │ -84.9% │ 0.1132
+frequency      │   0.570  │ 11.41%  │ +0.039  │ $0.3521  │ $-0.6479 │ -64.8% │ 0.2252
+bayesian       │   0.491  │  9.82%  │ -0.041  │ $0.1037  │ $-0.8963 │ -89.6% │ 0.1618
+隨機基準       │   0.532  │ 10.64%  │  0.000  │    —     │    —     │   —    │
 ```
 
 ---

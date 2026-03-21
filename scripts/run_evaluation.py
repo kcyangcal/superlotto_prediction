@@ -33,6 +33,7 @@ from typing import Dict, List
 ROOT_DIR = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
+import numpy as np
 import pandas as pd
 
 from config.settings   import DB_PATH, LOG_LEVEL, LOG_FORMAT
@@ -44,6 +45,7 @@ from src.evaluation.metrics import (
     print_fold_report,
     print_model_comparison_table,
     WHITE_COLS,
+    TICKET_COST,
 )
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
@@ -91,25 +93,38 @@ def evaluate_model_walk_forward(
     show_folds: bool = False,
 ) -> tuple:
     """
-    對單一模型執行完整的 Walk-Forward 評估。
+    對單一模型執行完整的 Walk-Forward 評估（Per-Draw 版本）。
 
-    評估邏輯（一個 Fold 的流程）：
-      1. 用 train_df 訓練模型
-      2. 模型 predict() 輸出推薦的 5 顆白球
-      3. 對 test_df 中的「每一期」，計算這 5 顆球的命中數
-      4. 收集所有 test 期的命中數，計算均值
+    【修正後的正確評估流程】
 
-    注意：
-      這裡模型對 test_df 中的所有期次「只預測一次」（以 train_df 結束點為基準）。
-      這是一個「折中方案」——完整的 walk-forward 應每期重訓，但這樣速度太慢。
-      理解這個假設的限制非常重要：若市場的統計特性（號碼分布）在測試期間
-      發生顯著變化（Concept Drift），這個方法會低估實際誤差。
+      每個 Fold 內部，對測試視窗的每一期做獨立預測：
+
+        cumulative = train_df（2020-01 ~ 2021-12）
+        ↓
+        第 1 期預測：用 cumulative 訓練 → 預測 → vs 2022-01-05 實際開獎 → 記錄
+        把 2022-01-05 加入 cumulative
+        ↓
+        第 2 期預測：用 cumulative（多了一期）訓練 → 預測 → vs 2022-01-08 → 記錄
+        把 2022-01-08 加入 cumulative
+        ↓
+        ... 重複直到 Fold 結束
+
+      這樣每期預測使用的是「到上一期為止的全部歷史」，
+      模型永遠不會「看到未來」，且每期都能學到最新資訊。
+
+      與舊版的差別：
+        舊版：訓練一次 → 用同一組球對整個 Fold 的 52 期比較（不更新）
+        新版：每期都重訓 → 每期給出不同推薦 → 逐期比較（正確）
+
+      速度說明：
+        Bayesian/Markov/Frequency 每次重訓約 1–10ms，52 期合計 < 1 秒。
+        MonteCarlo 每次約 500ms，52 期約 26 秒（較慢）。
 
     Args:
-        model_name: 模型名稱（用於 build_model 和報表顯示）
-        df:         完整資料 DataFrame
+        model_name: 模型名稱
+        df:         完整資料 DataFrame（已按日期升序）
         splitter:   WalkForwardSplit 切分器
-        show_folds: 是否在終端輸出每個 Fold 的詳細命中分布
+        show_folds: 是否顯示每個 Fold 的詳細結果
 
     Returns:
         (fold_results, fold_infos, agg)
@@ -121,52 +136,88 @@ def evaluate_model_walk_forward(
     for train_df, test_df, fold_info in splitter.split(df):
         total_folds += 1
         fold_infos.append(fold_info)
-
-        # ── 訓練 ────────────────────────────────────────────────────────────
-        try:
-            model = build_model(model_name)
-            model.fit(train_df)
-        except Exception as e:
-            logger.warning(f"Fold {fold_info.fold_idx} [{model_name}] 訓練失敗：{e}")
-            fold_results.append({})
-            continue
-
-        # ── 預測 ────────────────────────────────────────────────────────────
-        try:
-            prediction = model.predict(n_white=5)
-            predicted_balls = prediction.get("white_balls", [])
-        except Exception as e:
-            logger.warning(f"Fold {fold_info.fold_idx} [{model_name}] 預測失敗：{e}")
-            fold_results.append({})
-            continue
-
-        # ── 評估：對 test_df 每一期計算命中數 ─────────────────────────────
         fold_metric = FoldMetrics(fold_info=fold_info, model_name=model_name)
 
-        for _, row in test_df.iterrows():
-            actual_balls = [int(row[c]) for c in WHITE_COLS]
-            fold_metric.add(predicted_balls, actual_balls, k=5)
+        # ── Per-Draw 滾動預測 ────────────────────────────────────────────────
+        # cumulative 從訓練集開始，每看到一期實際開獎就擴充一期
+        cumulative = train_df.copy()
 
+        test_rows = list(test_df.iterrows())
+        for draw_i, (_, row) in enumerate(test_rows):
+            actual_balls = [int(row[c]) for c in WHITE_COLS]
+            actual_mega  = int(row["mega_number"]) if "mega_number" in row.index else None
+
+            # ① 以「目前為止的所有歷史（不含本期）」訓練模型
+            try:
+                model = build_model(model_name)
+                model.fit(cumulative)
+            except Exception as e:
+                logger.warning(
+                    f"Fold {fold_info.fold_idx} draw {draw_i+1} [{model_name}] 訓練失敗：{e}"
+                )
+                # 訓練失敗：記錄 0 命中並繼續
+                fold_metric.add([], actual_balls, None, actual_mega)
+                cumulative = pd.concat(
+                    [cumulative, test_df.iloc[[draw_i]]], ignore_index=True
+                )
+                continue
+
+            # ② 預測（此時模型看不到 row 這期的開獎）
+            try:
+                prediction      = model.predict(n_white=5)
+                predicted_balls = prediction.get("white_balls", [])
+                mega_list       = prediction.get("mega_balls", [])
+                predicted_mega  = int(mega_list[0]) if mega_list else None
+            except Exception as e:
+                logger.warning(
+                    f"Fold {fold_info.fold_idx} draw {draw_i+1} [{model_name}] 預測失敗：{e}"
+                )
+                predicted_balls, predicted_mega = [], None
+
+            # ③ 記錄命中數與獎金（此時才「揭曉」本期實際開獎）
+            fold_metric.add(
+                predicted_balls, actual_balls,
+                predicted_mega,  actual_mega,
+                k=5,
+            )
+
+            # ④ 把本期實際開獎加入累積訓練資料，供下一期使用
+            cumulative = pd.concat(
+                [cumulative, test_df.iloc[[draw_i]]], ignore_index=True
+            )
+
+        # ── 彙整本 Fold ──────────────────────────────────────────────────────
         summary = fold_metric.summary()
         fold_results.append(summary)
 
         if show_folds:
-            dist_str = "  ".join(
+            ev   = summary.get("ev_per_draw", 0)
+            net  = summary.get("net_ev_per_draw", 0)
+            dist = "  ".join(
                 f"{k}中:{v}" for k, v in summary.get("hit_dist_count", {}).items()
             )
             print(
-                f"  Fold {fold_info.fold_idx:2d} │ 測試 {fold_info.n_test:3d} 期 │ "
-                f"Avg Hits: {summary['mean_hits']:.3f} │ {dist_str}"
+                f"  Fold {fold_info.fold_idx:2d} | 測試 {fold_info.n_test:3d} 期 | "
+                f"Avg Hits: {summary['mean_hits']:.3f} | "
+                f"EV/期: ${ev:.4f} (淨: ${net:+.4f}) | {dist}"
             )
 
     # ── 彙整所有 Fold ────────────────────────────────────────────────────────
     valid_results = [r for r in fold_results if r]
     agg = aggregate_fold_results(valid_results)
 
+    # 加入跨 Fold 的 EV 統計
+    ev_per_fold = [r.get("ev_per_draw", 0) for r in valid_results]
+    if ev_per_fold:
+        agg["ev_avg"]     = float(np.mean(ev_per_fold))
+        agg["net_ev_avg"] = agg["ev_avg"] - TICKET_COST
+        agg["roi_pct"]    = agg["net_ev_avg"] / TICKET_COST * 100
+
     logger.info(
-        f"[{model_name}] 完成 {total_folds} 個 Fold，"
-        f"整體 Avg Hits={agg.get('mean_hits_avg', 0):.3f} "
-        f"（隨機基準≈0.532）"
+        f"[{model_name}] 完成 {total_folds} 個 Fold | "
+        f"Avg Hits={agg.get('mean_hits_avg', 0):.3f} | "
+        f"EV/期=${agg.get('ev_avg', 0):.4f} | "
+        f"淨EV=${agg.get('net_ev_avg', -1):.4f}"
     )
 
     return fold_results, fold_infos, agg

@@ -63,7 +63,12 @@ import pandas as pd
 
 from config.settings   import DB_PATH, LOG_LEVEL, LOG_FORMAT
 from src.database.repository import DrawRepository
-from src.evaluation.metrics  import hit_at_k
+from src.evaluation.metrics  import (
+    hit_at_k,
+    calc_prize,
+    expected_prize_no_mega,
+    TICKET_COST,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -153,6 +158,7 @@ def rolling_evaluate_model(
         dict 包含：hits_list, predictions, dates, mean_hits, std_hits, elapsed_sec
     """
     hits_list:       List[int]   = []
+    prizes_list:     List[float] = []   # 每期實際獲得的獎金
     predictions_log: List[dict]  = []
     model            = None
     t_start          = time.time()
@@ -181,6 +187,7 @@ def rolling_evaluate_model(
             except Exception as e:
                 logger.warning(f"  [{model_name}] 第 {i} 期訓練失敗：{e}")
                 hits_list.append(0)
+                prizes_list.append(0.0)
                 continue
         elif supports_partial_fit(model):
             # ── 增量更新（partial_fit）────────────────────────────────────
@@ -194,14 +201,27 @@ def rolling_evaluate_model(
             result           = model.predict(n_white=5)
             predicted_balls  = result.get("white_balls", [])
             proba_map        = result.get("proba", {})
+            mega_list        = result.get("mega_balls", [])
+            predicted_mega   = int(mega_list[0]) if mega_list else None
         except Exception as e:
             logger.warning(f"  [{model_name}] 第 {i} 期預測失敗：{e}")
             hits_list.append(0)
+            prizes_list.append(0.0)
             continue
 
-        # ── 計算命中數 ───────────────────────────────────────────────────
-        hits = hit_at_k(predicted_balls, actual_balls, k=5)
+        # ── 計算命中數 & 獎金 EV ─────────────────────────────────────────
+        hits         = hit_at_k(predicted_balls, actual_balls, k=5)
+        actual_mega  = int(actual_row["mega_number"]) if "mega_number" in actual_row.index else None
+
+        if predicted_mega is not None and actual_mega is not None:
+            mega_hit = (predicted_mega == actual_mega)
+            prize    = calc_prize(hits, mega_hit)
+        else:
+            # 模型未預測 Mega：用期望值（隨機猜 1/27 命中 Mega 的加權）
+            prize    = expected_prize_no_mega(hits)
+
         hits_list.append(hits)
+        prizes_list.append(prize)
 
         predictions_log.append({
             "draw_idx":    i,
@@ -209,15 +229,16 @@ def rolling_evaluate_model(
             "actual":      sorted(actual_balls),
             "predicted":   sorted(predicted_balls),
             "hits":        hits,
+            "prize":       prize,
         })
 
         if verbose:
-            hit_marker = "★" * hits if hits > 0 else "·"
+            hit_marker = "*" * hits if hits > 0 else "."
             print(
                 f"  [{model_name}] #{i:4d} {actual_row.get('draw_date', '')} | "
-                f"預測:{sorted(predicted_balls)} | "
-                f"實際:{sorted(actual_balls)} | "
-                f"命中:{hits} {hit_marker}"
+                f"Pred:{sorted(predicted_balls)} | "
+                f"Actual:{sorted(actual_balls)} | "
+                f"Hits:{hits} {hit_marker} | Prize:${prize:.2f}"
             )
 
         # 每 50 期顯示進度
@@ -228,25 +249,32 @@ def rolling_evaluate_model(
                 f"目前 Avg Hits={running_avg:.3f}（隨機基準≈{RANDOM_EXPECTED_HITS:.3f}）"
             )
 
-    elapsed = time.time() - t_start
-    mean_h  = float(np.mean(hits_list)) if hits_list else 0.0
-    std_h   = float(np.std(hits_list))  if hits_list else 0.0
+    elapsed  = time.time() - t_start
+    mean_h   = float(np.mean(hits_list))   if hits_list   else 0.0
+    std_h    = float(np.std(hits_list))    if hits_list   else 0.0
+    ev_draw  = float(np.mean(prizes_list)) if prizes_list else 0.0
+    net_ev   = ev_draw - TICKET_COST
+    roi_pct  = net_ev / TICKET_COST * 100
 
     logger.info(
         f"[{model_name}] 完成 {len(hits_list)} 期評估 | "
-        f"Avg Hits={mean_h:.4f} | Std={std_h:.4f} | "
-        f"耗時={elapsed:.1f}s"
+        f"Avg Hits={mean_h:.4f} | EV/期=${ev_draw:.4f} | "
+        f"淨EV=${net_ev:+.4f} | 耗時={elapsed:.1f}s"
     )
 
     return {
         "model_name":    model_name,
         "hits_list":     hits_list,
+        "prizes_list":   prizes_list,
         "predictions":   predictions_log,
         "n_draws":       len(hits_list),
         "mean_hits":     mean_h,
         "std_hits":      std_h,
         "precision_at5": mean_h / 5.0,
         "coverage":      float(np.mean(np.array(hits_list) > 0)),
+        "ev_per_draw":   ev_draw,
+        "net_ev":        net_ev,
+        "roi_pct":       roi_pct,
         "elapsed_sec":   elapsed,
     }
 
@@ -265,27 +293,29 @@ def print_rolling_report(all_results: Dict[str, dict]) -> None:
     print(" True Walk-Forward Rolling 評估結果（逐期更新）")
     print(SEP)
     print(
-        f"{'模型':<14} │ {'n_draws':>7} │ {'Avg Hits':>9} │ {'Prec@5':>7} │ "
-        f"{'vs Random':>10} │ {'Coverage':>8} │ {'耗時':>6}"
+        f"{'模型':<14} │ {'n':>5} │ {'Avg Hits':>9} │ {'Prec@5':>7} │ "
+        f"{'vs Rnd':>7} │ {'EV/期':>8} │ {'淨EV':>8} │ {'ROI%':>7}"
     )
-    print("─" * 78)
+    print("─" * 84)
 
     sorted_models = sorted(all_results.items(), key=lambda x: -x[1].get("mean_hits", 0))
 
     for name, r in sorted_models:
-        delta    = r["mean_hits"] - rand_h
-        delta_s  = f"{delta:+.4f}"
+        delta   = r["mean_hits"] - rand_h
+        delta_s = f"{delta:+.4f}"
+        ev      = r.get("ev_per_draw", 0.0)
+        net_ev  = r.get("net_ev",      -TICKET_COST)
+        roi     = r.get("roi_pct",     -100.0)
         print(
-            f"{name:<14} │ {r['n_draws']:>7} │ {r['mean_hits']:>9.4f} │ "
+            f"{name:<14} │ {r['n_draws']:>5} │ {r['mean_hits']:>9.4f} │ "
             f"{r['precision_at5']*100:>6.2f}% │ "
-            f"{delta_s:>10} │ {r['coverage']*100:>7.1f}% │ "
-            f"{r['elapsed_sec']:>5.1f}s"
+            f"{delta_s:>7} │ ${ev:>7.4f} │ ${net_ev:>+7.4f} │ {roi:>6.1f}%"
         )
 
-    print("─" * 78)
+    print("─" * 84)
     print(
-        f"{'隨機基準':<14} │ {'—':>7} │ {rand_h:>9.4f} │ "
-        f"{rand_p*100:>6.2f}% │ {'0.0000':>10} │ {'—':>8} │"
+        f"{'隨機基準':<14} │ {'—':>5} │ {rand_h:>9.4f} │ "
+        f"{rand_p*100:>6.2f}% │ {'0.0000':>7} │ {'—':>8} │ {'—':>8} │"
     )
     print(SEP)
 
@@ -321,8 +351,8 @@ def print_rolling_report(all_results: Dict[str, dict]) -> None:
         print(f"  {name:<14}: {ckpt_str}")
 
     print(SEP)
-    print("  ★ 命中 1 顆以上")
-    print(f"  隨機基準 Avg Hits ≈ {rand_h:.4f}（E[Hit@5] = 5 × 5/47）")
+    print("  * 命中 1 顆以上")
+    print(f"  隨機基準 Avg Hits ~= {rand_h:.4f}（E[Hit@5] = 5 x 5/47）")
     print("  注意：樣本量有限，與隨機的差異可能只是統計噪音")
     print(SEP)
 
