@@ -166,10 +166,18 @@ class EnsemblePredictor:
         top_indices = np.argsort(vote_score)[::-1][:n_white]
         top_white   = sorted([WHITE_NUMBERS[i] for i in top_indices])
 
+        # 正規化 vote_score 為機率 map
+        total_v = vote_score.sum()
+        proba_map = {
+            WHITE_NUMBERS[i]: float(vote_score[i] / total_v) if total_v > 0 else 0.0
+            for i in range(len(WHITE_NUMBERS))
+        }
+
         logger.info(f"集成學習推薦：白球={top_white}")
         return {
             "white_balls": top_white,
             "mega_balls":  [],
+            "proba":       proba_map,
             "model_votes": dict(self._predictions),
         }
 

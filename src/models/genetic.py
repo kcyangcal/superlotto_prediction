@@ -254,5 +254,13 @@ class GeneticPredictor:
             raise RuntimeError("請先呼叫 fit()")
 
         result = sorted(self._best_combo)[:n_white]
+
+        # 用個別號碼的適應度分數（頻率）作為機率 proxy
+        total_f = self._freq_arr.sum()
+        proba_map = {
+            WHITE_NUMBERS[i]: float(self._freq_arr[i] / total_f) if total_f > 0 else 0.0
+            for i in range(len(WHITE_NUMBERS))
+        }
+
         logger.info(f"遺傳演算法推薦：白球={result}")
-        return {"white_balls": result, "mega_balls": []}
+        return {"white_balls": result, "mega_balls": [], "proba": proba_map}

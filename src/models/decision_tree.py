@@ -151,9 +151,10 @@ class DecisionTreePredictor:
 
         top_indices = np.argsort(proba_appear)[::-1][:n_white]
         top_white   = sorted([WHITE_NUMBERS[i] for i in top_indices])
+        proba_map   = {WHITE_NUMBERS[i]: float(proba_appear[i]) for i in range(len(WHITE_NUMBERS))}
 
         logger.info(f"決策樹推薦：白球={top_white}")
-        return {"white_balls": top_white, "mega_balls": []}
+        return {"white_balls": top_white, "mega_balls": [], "proba": proba_map}
 
     def get_feature_importance(self) -> pd.DataFrame:
         """

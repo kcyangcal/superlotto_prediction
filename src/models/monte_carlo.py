@@ -116,8 +116,19 @@ class MonteCarloPredictor:
         )
         top_mega = self._sim_mega_freq.nlargest(n_mega).index.tolist()
 
+        # 正規化模擬頻率為機率 map
+        w_total = self._sim_white_freq.sum()
+        m_total = self._sim_mega_freq.sum()
+        proba_map      = (self._sim_white_freq / w_total).to_dict() if w_total > 0 else {}
+        mega_proba_map = (self._sim_mega_freq  / m_total).to_dict() if m_total > 0 else {}
+
         logger.info(f"蒙地卡羅推薦：白球={top_white}，Mega={top_mega}")
-        return {"white_balls": top_white, "mega_balls": top_mega}
+        return {
+            "white_balls": top_white,
+            "mega_balls":  top_mega,
+            "proba":       proba_map,
+            "mega_proba":  mega_proba_map,
+        }
 
     def get_simulation_stats(self) -> pd.DataFrame:
         """回傳模擬統計表（用於分析）"""

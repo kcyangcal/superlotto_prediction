@@ -84,9 +84,42 @@ RANDOM_EXPECTED_HITS = 5 * 5 / 47   # ≈ 0.532
 # 模型工廠
 # ─────────────────────────────────────────────────────────────────────────────
 
+# 各模型預設 retrain_every（每幾期重訓一次；1 = 每期）
+# NN 模型由 --retrain-every 控制，其餘依速度設定
+MODEL_RETRAIN_DEFAULTS = {
+    # 快速模型：每期重訓
+    "bayesian":     1,
+    "markov":       1,
+    "frequency":    1,
+    "knn":          1,
+    "decision_tree":1,
+    # 中速模型：每 3 期重訓
+    "rf":           3,
+    "xgb":          3,
+    "ensemble":     30,  # 每 30 期重訓（ensemble 內含 MC+GA，重訓成本高）
+    # 慢速模型：每 5 期重訓
+    "montecarlo":   5,
+    # 非常慢：每 10 期重訓
+    "genetic":      10,
+    # NN 由 CLI --retrain-every 控制
+    "mlp":          10,
+    "lstm":         10,
+}
+
+# 所有支援的模型列表（--models all 時使用）
+ALL_MODEL_NAMES = [
+    "frequency", "bayesian", "markov", "knn",
+    "decision_tree", "montecarlo", "genetic",
+    "rf", "xgb", "ensemble",
+    "mlp", "lstm",
+]
+
+
 def build_model(name: str, **kwargs):
     """根據名稱建立模型實例。"""
     name = name.lower().strip()
+
+    # ── Neural Networks ───────────────────────────────────────────────────────
     if name == "mlp":
         from src.models.neural_network import MLPPredictor
         return MLPPredictor(
@@ -100,6 +133,8 @@ def build_model(name: str, **kwargs):
             epochs=kwargs.get("epochs", 60),
             fine_tune_epochs=kwargs.get("fine_tune_epochs", 5),
         )
+
+    # ── 統計 / 機率模型 ───────────────────────────────────────────────────────
     elif name == "bayesian":
         from src.models.bayesian import BayesianPredictor
         return BayesianPredictor()
@@ -109,11 +144,59 @@ def build_model(name: str, **kwargs):
     elif name == "frequency":
         from src.models.baseline import FrequencyBaseline
         return FrequencyBaseline()
+    elif name == "montecarlo":
+        from src.models.monte_carlo import MonteCarloPredictor
+        return MonteCarloPredictor(
+            n_simulations=kwargs.get("n_simulations", 50_000)
+        )
+
+    # ── ML 模型 ───────────────────────────────────────────────────────────────
     elif name == "knn":
         from src.models.knn_model import KNNPredictor
         return KNNPredictor(k=kwargs.get("k", 10))
+    elif name == "decision_tree":
+        from src.models.decision_tree import DecisionTreePredictor
+        return DecisionTreePredictor()
+    elif name == "genetic":
+        from src.models.genetic import GeneticPredictor
+        return GeneticPredictor(
+            n_generations=kwargs.get("n_generations", 100),
+            population_size=kwargs.get("population_size", 30),
+        )
+
+    # ── RF / XGBoost 包裝器（classifier.py 介面不標準，用薄包裝） ──────────────
+    elif name in ("rf", "xgb"):
+        from src.models.classifier import LotteryClassifier
+
+        _target = name   # capture for closure
+
+        class _ClassifierWrapper:
+            """將 LotteryClassifier.predict_next() 包裝為標準 predict() 介面。"""
+            def fit(self, df):
+                self._clf = LotteryClassifier()
+                train_xgb = (_target == "xgb")
+                self._clf.fit(df, train_xgb=train_xgb)
+                return self
+
+            def predict(self, n_white: int = 5, **kw) -> dict:
+                result   = self._clf.predict_next(top_k=n_white)
+                key      = f"{_target}_prediction"
+                pred_d   = result.get(key, {})
+                balls    = pred_d.get("white_balls", [])
+                proba    = pred_d.get("probabilities", {})
+                return {"white_balls": balls, "mega_balls": [], "proba": proba}
+
+        return _ClassifierWrapper()
+
+    # ── 集成模型 ──────────────────────────────────────────────────────────────
+    elif name == "ensemble":
+        from src.models.ensemble import EnsemblePredictor
+        return EnsemblePredictor()
+
     else:
-        raise ValueError(f"未知模型：{name!r}")
+        raise ValueError(
+            f"未知模型：{name!r}。可用：{ALL_MODEL_NAMES}"
+        )
 
 
 def supports_partial_fit(model) -> bool:
@@ -532,6 +615,64 @@ def save_results_csv(all_results: Dict[str, dict], output_dir: Path) -> None:
         logger.info(f"  已匯出：{path}")
 
 
+def save_summary_csv(all_results: Dict[str, dict], output_path: Path) -> None:
+    """
+    將所有模型的 summary 指標（含 multi-ticket 策略）存為一個 CSV，
+    方便跨次執行比較。
+    """
+    import csv, datetime
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = []
+    run_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    for name, r in all_results.items():
+        n        = len(r.get("hits_list", []))
+        avg_hits = r.get("mean_hits", 0.0)
+        prec5    = r.get("precision_at5", 0.0)
+        vs_rnd   = avg_hits - (5 * 5 / 47)
+        ev       = r.get("ev_per_draw", 0.0)
+        net_ev   = r.get("net_ev", 0.0)
+        roi      = r.get("roi_pct", -100.0)
+        elapsed  = r.get("elapsed_sec", 0.0)
+
+        base_row = {
+            "run_time":   run_ts,
+            "model":      name,
+            "n_draws":    n,
+            "avg_hits":   round(avg_hits, 4),
+            "prec_at5":   round(prec5, 4),
+            "vs_random":  round(vs_rnd, 4),
+            "ev_per_draw": round(ev, 4),
+            "net_ev":     round(net_ev, 4),
+            "roi_pct":    round(roi, 2),
+            "elapsed_sec": round(elapsed, 1),
+        }
+
+        # multi-ticket 欄位：buy_1 到 buy_5
+        mt = r.get("multi_ticket", {})
+        for k in range(1, 6):
+            s = mt.get(k, {})
+            base_row[f"buy{k}_ev"]     = round(s.get("ev_per_draw", 0.0), 4)
+            base_row[f"buy{k}_net_ev"] = round(s.get("net_ev", 0.0), 4)
+            base_row[f"buy{k}_roi"]    = round(s.get("roi_pct", -100.0), 2)
+
+        rows.append(base_row)
+
+    if not rows:
+        return
+
+    fieldnames = list(rows[0].keys())
+    file_exists = output_path.exists()
+
+    with open(output_path, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+    logger.info(f"Summary CSV 已儲存/追加：{output_path}（{len(rows)} 行）")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 主程式
 # ─────────────────────────────────────────────────────────────────────────────
@@ -547,8 +688,8 @@ def parse_args():
     parser.add_argument("--retrain-every",  type=int, default=10,
                         help="NN 每幾期完整重訓一次（其餘用 partial_fit，預設 10）")
     parser.add_argument("--models",
-                        default="mlp,lstm,bayesian,markov,frequency",
-                        help="逗號分隔的模型名稱")
+                        default="frequency,bayesian,markov,montecarlo,knn,decision_tree,genetic,rf,xgb,ensemble",
+                        help=f"逗號分隔的模型名稱，或 'all'。可用：{ALL_MODEL_NAMES}")
     parser.add_argument("--no-lstm",        action="store_true", help="跳過 LSTM（無 PyTorch 時使用）")
     parser.add_argument("--verbose",        action="store_true", help="逐期印出預測結果")
     parser.add_argument("--export-csv",     action="store_true", help="將預測記錄匯出為 CSV")
@@ -583,7 +724,12 @@ def main():
         sys.exit(1)
 
     # ── 2. 解析模型列表 ───────────────────────────────────────────────────────
-    model_names = [m.strip() for m in args.models.split(",") if m.strip()]
+    raw_models  = args.models.strip().lower()
+    if raw_models == "all":
+        model_names = [m for m in ALL_MODEL_NAMES]
+    else:
+        model_names = [m.strip() for m in raw_models.split(",") if m.strip()]
+
     if args.no_lstm and "lstm" in model_names:
         model_names.remove("lstm")
         logger.info("已跳過 LSTM 模型")
@@ -591,7 +737,7 @@ def main():
     actual_test_draws = min(args.test_draws, len(df) - args.initial_train)
     logger.info(f"評估設定：初始訓練 {args.initial_train} 期，評估 {actual_test_draws} 期")
     logger.info(f"模型列表：{model_names}")
-    logger.info(f"NN 每 {args.retrain_every} 期完整重訓，其餘用 partial_fit")
+    logger.info(f"NN 每 {args.retrain_every} 期完整重訓，慢速模型依預設週期重訓")
 
     # ── 3. 逐模型評估 ─────────────────────────────────────────────────────────
     all_results: Dict[str, dict] = {}
@@ -601,9 +747,10 @@ def main():
         print(f" Rolling 評估：{model_name.upper()}")
         print(f"{'─'*60}")
 
-        # 快速模型（非 NN）每期完整重訓，NN 使用 retrain_every
-        is_nn    = model_name in ("mlp", "lstm")
-        r_every  = args.retrain_every if is_nn else 1
+        # 決定 retrain_every：NN 用 CLI 參數，其他依 MODEL_RETRAIN_DEFAULTS
+        is_nn   = model_name in ("mlp", "lstm")
+        r_every = args.retrain_every if is_nn else MODEL_RETRAIN_DEFAULTS.get(model_name, 1)
+        logger.info(f"  [{model_name}] retrain_every={r_every}")
 
         model_kwargs = {}
         if model_name == "mlp":
@@ -636,11 +783,16 @@ def main():
 
     print_rolling_report(all_results)
 
-    # ── 5. 匯出 CSV（選用）───────────────────────────────────────────────────
+    # ── 5. 自動存 summary CSV ─────────────────────────────────────────────────
+    summary_path = ROOT_DIR / "results" / "rolling_eval_summary.csv"
+    save_summary_csv(all_results, summary_path)
+    print(f"\n  Summary CSV 已儲存：{summary_path}")
+
+    # ── 6. 匯出逐期預測 CSV（選用）──────────────────────────────────────────
     if args.export_csv:
         from config.settings import EXPORTS_DIR
         save_results_csv(all_results, EXPORTS_DIR / "rolling_eval")
-        print(f"\n  CSV 已匯出至：{EXPORTS_DIR / 'rolling_eval'}")
+        print(f"\n  逐期 CSV 已匯出至：{EXPORTS_DIR / 'rolling_eval'}")
 
 
 if __name__ == "__main__":
