@@ -90,9 +90,21 @@ class FrequencyBaseline:
         # Mega 球只看全歷史頻率
         top_mega  = self._mega_freq_all.nlargest(n_mega).index.tolist()
 
-        result = {"white_balls": top_white, "mega_balls": top_mega}
+        # 正規化機率 map（供 multi-ticket 生成使用）
+        total_w = combined_score.sum()
+        proba_map = (combined_score / total_w if total_w > 0 else combined_score).to_dict()
+        total_m = self._mega_freq_all.sum()
+        mega_proba_map = (
+            self._mega_freq_all / total_m if total_m > 0 else self._mega_freq_all
+        ).to_dict()
+
         logger.info(f"FrequencyBaseline 推薦：白球={top_white}，Mega={top_mega}")
-        return result
+        return {
+            "white_balls": top_white,
+            "mega_balls":  top_mega,
+            "proba":       proba_map,
+            "mega_proba":  mega_proba_map,
+        }
 
     def get_probability_ranking(self) -> pd.DataFrame:
         """

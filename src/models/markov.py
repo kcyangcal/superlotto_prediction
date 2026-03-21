@@ -131,8 +131,19 @@ class MarkovPredictor:
         mega_prob = self._mega_transition[mega_idx]
         top_mega  = [int(np.argmax(mega_prob)) + 1]
 
+        # 正規化機率 map（供 multi-ticket 生成使用）
+        total_w = combined_prob.sum()
+        norm_w  = combined_prob / total_w if total_w > 0 else combined_prob
+        proba_map      = {idx + 1: float(norm_w[idx])    for idx in range(N_WHITE)}
+        mega_proba_map = {idx + 1: float(mega_prob[idx]) for idx in range(N_MEGA)}
+
         logger.info(f"馬可夫鏈推薦：白球={top_white}，Mega={top_mega}")
-        return {"white_balls": top_white, "mega_balls": top_mega}
+        return {
+            "white_balls": top_white,
+            "mega_balls":  top_mega,
+            "proba":       proba_map,
+            "mega_proba":  mega_proba_map,
+        }
 
     def get_transition_prob(self, number: int) -> pd.Series:
         """

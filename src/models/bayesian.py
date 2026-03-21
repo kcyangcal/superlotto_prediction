@@ -107,8 +107,9 @@ class BayesianPredictor:
             .index.sort_values()
             .tolist()
         )
+        proba_map = self._posterior.to_dict()
         logger.info(f"貝氏推論推薦：白球={top_white}")
-        return {"white_balls": top_white, "mega_balls": []}
+        return {"white_balls": top_white, "mega_balls": [], "proba": proba_map}
 
     def get_posterior(self) -> pd.DataFrame:
         """回傳完整後驗分析表"""

@@ -52,6 +52,7 @@ import argparse
 import logging
 import sys
 import time
+from itertools import combinations as itertools_combinations
 from pathlib import Path
 from typing import Dict, List
 
@@ -69,6 +70,8 @@ from src.evaluation.metrics  import (
     expected_prize_no_mega,
     TICKET_COST,
 )
+
+MAX_TICKETS = 5   # 最多同時評估幾組組合策略
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -118,6 +121,57 @@ def supports_partial_fit(model) -> bool:
     return hasattr(model, "partial_fit")
 
 
+def generate_top_k_tickets(
+    white_proba:  dict,
+    mega_proba:   dict,
+    n_tickets:    int = MAX_TICKETS,
+    n_candidates: int = 12,
+) -> List[dict]:
+    """
+    從白球機率分布中生成機率最高的 n_tickets 組彩票組合。
+
+    做法：
+      1. 取 top n_candidates 個白球（降低枚舉量：C(12,5)=792）
+      2. 對所有 C(n_candidates,5) 組合，以 sum(prob) 排分
+      3. 取最高分的 n_tickets 組
+      4. 每組配上機率最高的 Mega 球（若有 mega_proba 則確定配，否則 None）
+
+    Args:
+        white_proba:  {球號: 機率} 47 顆白球的機率 map
+        mega_proba:   {球號: 機率} Mega 球機率 map（可為空 dict）
+        n_tickets:    要生成幾組組合
+        n_candidates: 從機率最高的幾顆球中枚舉組合（trade-off 速度 vs 覆蓋）
+
+    Returns:
+        list of {"white_balls": [int, ...], "mega_ball": int or None}
+    """
+    if not white_proba:
+        return []
+
+    # ── 1. 取 top n_candidates 白球候選 ─────────────────────────────────────
+    sorted_balls = sorted(white_proba.keys(), key=lambda b: -white_proba[b])
+    candidates   = sorted_balls[:n_candidates]
+
+    # ── 2. 枚舉組合，按 sum(prob) 排序 ──────────────────────────────────────
+    scored = [
+        (sum(white_proba[b] for b in combo), sorted(combo))
+        for combo in itertools_combinations(candidates, 5)
+    ]
+    scored.sort(reverse=True)
+
+    # ── 3. 最可能的 Mega 球 ──────────────────────────────────────────────────
+    best_mega = (
+        max(mega_proba.keys(), key=lambda m: mega_proba[m])
+        if mega_proba else None
+    )
+
+    # ── 4. 組裝彩票 ─────────────────────────────────────────────────────────
+    return [
+        {"white_balls": white_balls, "mega_ball": best_mega}
+        for _, white_balls in scored[:n_tickets]
+    ]
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Rolling 評估核心
 # ─────────────────────────────────────────────────────────────────────────────
@@ -129,6 +183,8 @@ def rolling_evaluate_model(
     test_draws:      int,
     retrain_every:   int  = 1,
     verbose:         bool = False,
+    n_tickets:       int  = MAX_TICKETS,
+    n_candidates:    int  = 12,
     **model_kwargs,
 ) -> dict:
     """
@@ -137,11 +193,11 @@ def rolling_evaluate_model(
     流程：
       ① 初始訓練：使用前 initial_train_n 期訓練模型
       ② 對接下來每一期（最多 test_draws 期）：
-         a) 預測下一期（5顆球）
+         a) 預測下一期（最多 n_tickets 組組合）
          b) 看實際開獎
-         c) 記錄命中數
+         c) 記錄各組命中數與獎金
          d) 更新模型（partial_fit 或 全量重訓）
-      ③ 彙整統計
+      ③ 彙整統計（含買 1~n_tickets 組的多策略比較）
 
     Args:
         model_name:      模型名稱
@@ -152,14 +208,18 @@ def rolling_evaluate_model(
                          1 = 每期完整重訓（最準確，最慢）
                          N>1 = 其餘期次用 partial_fit（折中方案）
         verbose:         是否逐期印出結果
+        n_tickets:       每期生成幾組候選組合（用於多策略評估，預設 5）
+        n_candidates:    從幾顆最高機率球中枚舉組合（預設 12，C(12,5)=792）
         **model_kwargs:  傳入 build_model 的額外參數
 
     Returns:
-        dict 包含：hits_list, predictions, dates, mean_hits, std_hits, elapsed_sec
+        dict 包含：hits_list, predictions, dates, mean_hits, std_hits, elapsed_sec,
+                   multi_ticket（買 1~n_tickets 組各策略的 EV/淨EV/ROI）
     """
-    hits_list:       List[int]   = []
-    prizes_list:     List[float] = []   # 每期實際獲得的獎金
-    predictions_log: List[dict]  = []
+    hits_list:          List[int]         = []
+    prizes_list:        List[float]       = []   # 每期實際獲得的獎金（買第1組）
+    multi_prizes_list:  List[List[float]] = []   # 每期各組票的獎金 [p1, p2, ..., pK]
+    predictions_log:    List[dict]        = []
     model            = None
     t_start          = time.time()
     n_total          = min(initial_train_n + test_draws, len(df))
@@ -201,25 +261,49 @@ def rolling_evaluate_model(
             result           = model.predict(n_white=5)
             predicted_balls  = result.get("white_balls", [])
             proba_map        = result.get("proba", {})
+            mega_proba_map   = result.get("mega_proba", {})
             mega_list        = result.get("mega_balls", [])
             predicted_mega   = int(mega_list[0]) if mega_list else None
         except Exception as e:
             logger.warning(f"  [{model_name}] 第 {i} 期預測失敗：{e}")
             hits_list.append(0)
             prizes_list.append(0.0)
+            multi_prizes_list.append([0.0] * n_tickets)
             continue
 
-        # ── 計算命中數 & 獎金 EV ─────────────────────────────────────────
-        hits         = hit_at_k(predicted_balls, actual_balls, k=5)
-        actual_mega  = int(actual_row["mega_number"]) if "mega_number" in actual_row.index else None
+        actual_mega = int(actual_row["mega_number"]) if "mega_number" in actual_row.index else None
 
-        if predicted_mega is not None and actual_mega is not None:
-            mega_hit = (predicted_mega == actual_mega)
-            prize    = calc_prize(hits, mega_hit)
+        # ── 生成 top-K 組合 ───────────────────────────────────────────────
+        # 若有機率 map，枚舉最可能的 n_tickets 組；否則全部用第一組預測填充
+        if proba_map:
+            tickets = generate_top_k_tickets(
+                proba_map, mega_proba_map, n_tickets, n_candidates
+            )
+            if not tickets:
+                tickets = [{"white_balls": predicted_balls, "mega_ball": predicted_mega}]
+            # 不足 n_tickets 組時，用最後一組補齊（避免 index 越界）
+            while len(tickets) < n_tickets:
+                tickets.append(tickets[-1])
         else:
-            # 模型未預測 Mega：用期望值（隨機猜 1/27 命中 Mega 的加權）
-            prize    = expected_prize_no_mega(hits)
+            tickets = [{"white_balls": predicted_balls, "mega_ball": predicted_mega}] * n_tickets
 
+        # ── 計算每張票的命中數 & 獎金 ────────────────────────────────────
+        draw_prizes: List[float] = []
+        for ticket in tickets:
+            t_balls = ticket["white_balls"]
+            t_mega  = ticket["mega_ball"]
+            t_hits  = hit_at_k(t_balls, actual_balls, k=5)
+            if t_mega is not None and actual_mega is not None:
+                t_prize = calc_prize(t_hits, t_mega == actual_mega)
+            else:
+                t_prize = expected_prize_no_mega(t_hits)
+            draw_prizes.append(t_prize)
+
+        multi_prizes_list.append(draw_prizes)
+
+        # ── 單組統計（買第 1 組，與舊邏輯相容）────────────────────────────
+        hits  = hit_at_k(tickets[0]["white_balls"], actual_balls, k=5)
+        prize = draw_prizes[0]
         hits_list.append(hits)
         prizes_list.append(prize)
 
@@ -227,7 +311,7 @@ def rolling_evaluate_model(
             "draw_idx":    i,
             "draw_date":   str(actual_row.get("draw_date", "")),
             "actual":      sorted(actual_balls),
-            "predicted":   sorted(predicted_balls),
+            "predicted":   sorted(tickets[0]["white_balls"]),
             "hits":        hits,
             "prize":       prize,
         })
@@ -236,7 +320,7 @@ def rolling_evaluate_model(
             hit_marker = "*" * hits if hits > 0 else "."
             print(
                 f"  [{model_name}] #{i:4d} {actual_row.get('draw_date', '')} | "
-                f"Pred:{sorted(predicted_balls)} | "
+                f"Pred1:{sorted(tickets[0]['white_balls'])} | "
                 f"Actual:{sorted(actual_balls)} | "
                 f"Hits:{hits} {hit_marker} | Prize:${prize:.2f}"
             )
@@ -255,6 +339,23 @@ def rolling_evaluate_model(
     ev_draw  = float(np.mean(prizes_list)) if prizes_list else 0.0
     net_ev   = ev_draw - TICKET_COST
     roi_pct  = net_ev / TICKET_COST * 100
+
+    # ── 多組策略彙整：買 1~n_tickets 組的 EV/淨EV/ROI ──────────────────────
+    multi_ticket: Dict[int, dict] = {}
+    if multi_prizes_list:
+        actual_k = len(multi_prizes_list[0])   # 實際生成的票數
+        for buy_n in range(1, actual_k + 1):
+            per_draw_ev = [sum(dp[:buy_n]) for dp in multi_prizes_list]
+            ev_n    = float(np.mean(per_draw_ev))
+            cost_n  = buy_n * TICKET_COST
+            net_n   = ev_n - cost_n
+            roi_n   = net_n / cost_n * 100
+            multi_ticket[buy_n] = {
+                "ev_per_draw":   ev_n,
+                "cost_per_draw": cost_n,
+                "net_ev":        net_n,
+                "roi_pct":       roi_n,
+            }
 
     logger.info(
         f"[{model_name}] 完成 {len(hits_list)} 期評估 | "
@@ -276,6 +377,7 @@ def rolling_evaluate_model(
         "net_ev":        net_ev,
         "roi_pct":       roi_pct,
         "elapsed_sec":   elapsed,
+        "multi_ticket":  multi_ticket,
     }
 
 
@@ -356,6 +458,67 @@ def print_rolling_report(all_results: Dict[str, dict]) -> None:
     print("  注意：樣本量有限，與隨機的差異可能只是統計噪音")
     print(SEP)
 
+    # ── Multi-Ticket Strategy 比較表 ────────────────────────────────────────
+    _print_multi_ticket_table(sorted_models)
+
+
+def _print_multi_ticket_table(sorted_models: list) -> None:
+    """
+    印出「每期買 N 組最可能組合」的 EV/淨EV/ROI 比較表。
+
+    表格格式：
+      模型         │ 買1組              │ 買2組              │ ... │ 買5組
+                   │ EV    淨EV   ROI%  │ EV    淨EV   ROI%  │ ...
+    """
+    # 確認有 multi_ticket 資料
+    has_multi = any(r.get("multi_ticket") for _, r in sorted_models)
+    if not has_multi:
+        return
+
+    # 取最大票數
+    max_k = max(
+        (max(r["multi_ticket"].keys()) for _, r in sorted_models if r.get("multi_ticket")),
+        default=0
+    )
+    if max_k == 0:
+        return
+
+    col_w   = 24   # 每個「買N組」欄位寬度
+    name_w  = 14
+    SEP2    = "═" * (name_w + 3 + max_k * (col_w + 3))
+
+    print(f"\n{SEP2}")
+    print(f" Multi-Ticket Strategy 比較（每期買 N 組最可能組合）")
+    print(f" 成本 = N × $1；獎金 = 各組票獎金加總；淨EV = 總獎金 − 總成本")
+    print(SEP2)
+
+    # 標題行
+    header_cols = " │ ".join(f"{'買'+str(n)+'組':^{col_w}}" for n in range(1, max_k + 1))
+    print(f"{'模型':<{name_w}} │ {header_cols}")
+
+    sub_header  = " │ ".join(
+        f"{'EV':>7}  {'淨EV':>7}  {'ROI%':>6}" for _ in range(max_k)
+    )
+    print(f"{'':<{name_w}} │ {sub_header}")
+    print("─" * (name_w + 3 + max_k * (col_w + 3)))
+
+    for name, r in sorted_models:
+        mt = r.get("multi_ticket", {})
+        if not mt:
+            continue
+        cols = []
+        for n in range(1, max_k + 1):
+            s = mt.get(n, {})
+            ev  = s.get("ev_per_draw",   0.0)
+            nev = s.get("net_ev",        0.0)
+            roi = s.get("roi_pct",     -100.0)
+            cols.append(f"${ev:>5.3f}  ${nev:>+6.3f}  {roi:>5.1f}%")
+        print(f"{name:<{name_w}} │ " + " │ ".join(cols))
+
+    print("─" * (name_w + 3 + max_k * (col_w + 3)))
+    print("  注意：票組間可能有重複號碼；買多組不代表覆蓋更多不同號碼")
+    print(f"{SEP2}")
+
 
 def save_results_csv(all_results: Dict[str, dict], output_dir: Path) -> None:
     """將每個模型的逐期預測記錄匯出為 CSV。"""
@@ -391,6 +554,10 @@ def parse_args():
     parser.add_argument("--export-csv",     action="store_true", help="將預測記錄匯出為 CSV")
     parser.add_argument("--lstm-epochs",    type=int, default=60,  help="LSTM 初始訓練 epochs")
     parser.add_argument("--mlp-epochs",     type=int, default=80,  help="MLP 初始訓練 epochs")
+    parser.add_argument("--n-tickets",      type=int, default=MAX_TICKETS,
+                        help=f"每期生成幾組候選組合（multi-ticket 策略，預設 {MAX_TICKETS}）")
+    parser.add_argument("--n-candidates",   type=int, default=12,
+                        help="枚舉組合時使用前幾顆高機率球（預設 12，C(12,5)=792）")
     return parser.parse_args()
 
 
@@ -452,6 +619,8 @@ def main():
                 test_draws      = actual_test_draws,
                 retrain_every   = r_every,
                 verbose         = args.verbose,
+                n_tickets       = args.n_tickets,
+                n_candidates    = args.n_candidates,
                 **model_kwargs,
             )
             all_results[model_name.upper()] = result
