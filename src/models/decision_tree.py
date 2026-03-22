@@ -26,7 +26,9 @@ from config.settings import (
     WHITE_BALL_MIN, WHITE_BALL_MAX,
     LOG_LEVEL, LOG_FORMAT,
 )
-from src.features.base_stats import compute_white_ball_frequency, build_number_current_gap
+from src.features.base_stats import (
+    compute_white_ball_frequency, build_number_current_gap, build_number_gap_stats,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -41,7 +43,7 @@ class DecisionTreePredictor:
     決策樹多標籤彩票預測器。
 
     為每個號碼獨立訓練決策樹分類器：
-      輸入特徵  → 94維（gap 47 + 近30期頻率 47）
+      輸入特徵  → 188維（gap 47 + gap_ratio 47 + freq_30 47 + freq_100 47）
       輸出標籤  → 47維二元向量（是否出現）
 
     訓練策略：時序切分（前 train_ratio 訓練，後面測試），不 shuffle。
@@ -73,14 +75,22 @@ class DecisionTreePredictor:
         self._is_fitted  = False
 
     def _build_feature_vector(self, df_upto: pd.DataFrame) -> np.ndarray:
-        """為截至某期的資料建立特徵向量（94維）。"""
-        gap_dict      = build_number_current_gap(df_upto)
-        gap_features  = np.array([gap_dict[n] for n in WHITE_NUMBERS], dtype=np.float32)
+        """為截至某期的資料建立特徵向量（188維）。"""
+        # gap + avg_gap（單次遍歷同時計算）
+        current_gap, avg_gap = build_number_gap_stats(df_upto)
+        gap_features       = np.array([current_gap[n] for n in WHITE_NUMBERS], dtype=np.float32)
+        avg_gap_features   = np.array([avg_gap[n]     for n in WHITE_NUMBERS], dtype=np.float32)
+        gap_ratio_features = gap_features / np.maximum(avg_gap_features, 1.0)
 
-        freq          = compute_white_ball_frequency(df_upto, window=self.freq_window)
-        freq_features = np.array([freq.get(n, 0) for n in WHITE_NUMBERS], dtype=np.float32)
+        # 近期頻率（freq_window，預設 30）
+        freq30         = compute_white_ball_frequency(df_upto, window=self.freq_window)
+        freq30_features = np.array([freq30.get(n, 0) for n in WHITE_NUMBERS], dtype=np.float32)
 
-        return np.concatenate([gap_features, freq_features])
+        # 長期頻率（freq_100）
+        freq100         = compute_white_ball_frequency(df_upto, window=min(100, len(df_upto)))
+        freq100_features = np.array([freq100.get(n, 0) for n in WHITE_NUMBERS], dtype=np.float32)
+
+        return np.concatenate([gap_features, gap_ratio_features, freq30_features, freq100_features])
 
     def _build_label_vector(self, row: pd.Series) -> np.ndarray:
         """從一期開獎記錄建立 47 維二元標籤向量。"""
@@ -173,8 +183,10 @@ class DecisionTreePredictor:
         ]).mean(axis=0)
 
         feature_names = (
-            [f"gap_{n}"  for n in WHITE_NUMBERS] +
-            [f"freq_{n}" for n in WHITE_NUMBERS]
+            [f"gap_{n}"       for n in WHITE_NUMBERS] +
+            [f"gap_ratio_{n}" for n in WHITE_NUMBERS] +
+            [f"freq30_{n}"    for n in WHITE_NUMBERS] +
+            [f"freq100_{n}"   for n in WHITE_NUMBERS]
         )
         return (
             pd.DataFrame({"feature_name": feature_names, "importance": importances})

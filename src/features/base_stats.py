@@ -199,3 +199,41 @@ def build_number_current_gap(df: pd.DataFrame) -> dict[int, int]:
         n: max_idx - last_seen.get(n, -1)
         for n in WHITE_NUMBERS
     }
+
+
+def build_number_gap_stats(df: pd.DataFrame) -> tuple[dict[int, int], dict[int, float]]:
+    """
+    單次遍歷同時計算每個白球號碼的 current_gap 和 avg_gap。
+    比分別呼叫 build_number_current_gap + compute_gap_stats 快一倍。
+
+    Args:
+        df: 開獎資料 DataFrame，已按 draw_number 升序排列
+
+    Returns:
+        (current_gap_dict, avg_gap_dict)
+        current_gap_dict: dict[號碼, 當前缺席期數]
+        avg_gap_dict:     dict[號碼, 歷史平均間距]（無記錄的號碼用總期數代替）
+    """
+    df = df.sort_values("draw_number").reset_index(drop=True)
+    n_total = len(df)
+    last_seen: dict[int, int] = {}
+    gap_sums:  dict[int, float] = {n: 0.0 for n in WHITE_NUMBERS}
+    gap_counts: dict[int, int]  = {n: 0   for n in WHITE_NUMBERS}
+
+    for idx in range(n_total):
+        row = df.iloc[idx]
+        for col in WHITE_COLS:
+            ball = int(row[col])
+            if ball in last_seen:
+                gap = idx - last_seen[ball]
+                gap_sums[ball]   += gap
+                gap_counts[ball] += 1
+            last_seen[ball] = idx
+
+    max_idx = n_total - 1
+    current_gap = {n: max_idx - last_seen.get(n, -1) for n in WHITE_NUMBERS}
+    avg_gap = {
+        n: gap_sums[n] / gap_counts[n] if gap_counts[n] > 0 else float(n_total)
+        for n in WHITE_NUMBERS
+    }
+    return current_gap, avg_gap

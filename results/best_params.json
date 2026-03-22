@@ -1,0 +1,22 @@
+{
+  "xgb": {
+    "best_val": 0.7333333333333333,
+    "params": {
+      "n_estimators": 100,
+      "max_depth": 5,
+      "learning_rate": 0.05008187444843053,
+      "subsample": 0.630254021919422,
+      "colsample_bytree": 0.7732795399236628,
+      "min_child_weight": 5
+    }
+  },
+  "rf": {
+    "best_val": 0.7833333333333333,
+    "params": {
+      "n_estimators": 50,
+      "max_depth": 6,
+      "min_samples_leaf": 1,
+      "max_features": 0.5
+    }
+  }
+}

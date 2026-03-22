@@ -98,16 +98,18 @@ def train_random_forest(
     """
     logger.info(f"訓練 Random Forest（{RF_N_ESTIMATORS} 棵決策樹，使用所有 CPU 核心）...")
 
+    # Best params from Optuna HPO (30 trials, val Avg Hits=0.7833)
     base_clf = RandomForestClassifier(
-        n_estimators  = RF_N_ESTIMATORS,
-        class_weight  = "balanced",  # 解決 1:9 類別不平衡
-        max_features  = "sqrt",      # 每棵樹隨機選 sqrt(n_features) 個特徵
-        min_samples_leaf = 3,        # 葉節點至少 3 個樣本，防止過擬合
-        random_state  = RF_RANDOM_STATE,
-        n_jobs        = -1,          # 使用全部 CPU 核心
+        n_estimators     = 50,
+        max_depth        = 6,
+        min_samples_leaf = 1,
+        max_features     = 0.5,
+        class_weight     = "balanced",
+        random_state     = RF_RANDOM_STATE,
+        n_jobs           = 1,   # MultiOutput handles parallelism
     )
 
-    model = MultiOutputClassifier(base_clf, n_jobs=-1)
+    model = MultiOutputClassifier(base_clf, n_jobs=-1)  # 47 classifiers in parallel
     model.fit(X_train, y_train)
 
     logger.info("Random Forest 訓練完成")
@@ -145,20 +147,21 @@ def train_xgboost(
 
     logger.info(f"訓練 XGBoost（scale_pos_weight={pos_weight:.1f}）...")
 
+    # Best params from Optuna HPO (30 trials, val Avg Hits=0.7333)
     base_clf = XGBClassifier(
-        n_estimators      = 300,
-        max_depth         = 4,
-        learning_rate     = 0.05,
-        subsample         = 0.8,
-        colsample_bytree  = 0.8,
-        scale_pos_weight  = pos_weight,  # 處理類別不平衡
-        use_label_encoder = False,
-        eval_metric       = "logloss",
-        random_state      = RF_RANDOM_STATE,
-        n_jobs            = -1,
+        n_estimators     = 100,
+        max_depth        = 5,
+        learning_rate    = 0.050,
+        subsample        = 0.630,
+        colsample_bytree = 0.773,
+        min_child_weight = 5,
+        scale_pos_weight = pos_weight,
+        eval_metric      = "logloss",
+        random_state     = RF_RANDOM_STATE,
+        n_jobs           = 1,   # MultiOutput handles parallelism
     )
 
-    model = MultiOutputClassifier(base_clf, n_jobs=1)  # XGBoost 自身已並行，外層設 n_jobs=1
+    model = MultiOutputClassifier(base_clf, n_jobs=-1)  # 47 classifiers in parallel
     model.fit(X_train, y_train)
 
     logger.info("XGBoost 訓練完成")

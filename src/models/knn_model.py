@@ -25,7 +25,9 @@ from config.settings import (
     WHITE_BALL_MIN, WHITE_BALL_MAX,
     LOG_LEVEL, LOG_FORMAT,
 )
-from src.features.base_stats import compute_white_ball_frequency, build_number_current_gap
+from src.features.base_stats import (
+    compute_white_ball_frequency, build_number_current_gap, build_number_gap_stats,
+)
 
 logging.basicConfig(level=LOG_LEVEL, format=LOG_FORMAT)
 logger = logging.getLogger(__name__)
@@ -38,7 +40,7 @@ class KNNPredictor:
     """
     K 最近鄰歷史相似期預測器。
 
-    特徵向量 = [每個號碼的 current_gap (47維) + 最近20期頻率 (47維)] = 94維
+    特徵向量 = [current_gap(47) + gap_ratio(47) + freq_window(47) + freq_100(47)] = 188維
     """
 
     def __init__(self, k: int = 10, freq_window: int = 20):
@@ -62,17 +64,23 @@ class KNNPredictor:
             df_upto: 截至某期（含）的歷史資料
 
         Returns:
-            np.ndarray, shape=(94,)
+            np.ndarray, shape=(188,)
         """
-        # Gap 特徵（47維）
-        gap_dict     = build_number_current_gap(df_upto)
-        gap_features = np.array([gap_dict[n] for n in WHITE_NUMBERS], dtype=np.float32)
+        # Gap + avg_gap（單次遍歷）
+        current_gap, avg_gap = build_number_gap_stats(df_upto)
+        gap_features       = np.array([current_gap[n] for n in WHITE_NUMBERS], dtype=np.float32)
+        avg_gap_arr        = np.array([avg_gap[n]     for n in WHITE_NUMBERS], dtype=np.float32)
+        gap_ratio_features = gap_features / np.maximum(avg_gap_arr, 1.0)
 
-        # 近期頻率特徵（47維）
+        # 近期頻率（freq_window，預設 20）
         freq         = compute_white_ball_frequency(df_upto, window=self.freq_window)
         freq_features = np.array([freq.get(n, 0) for n in WHITE_NUMBERS], dtype=np.float32)
 
-        return np.concatenate([gap_features, freq_features])
+        # 長期頻率（freq_100）
+        freq100         = compute_white_ball_frequency(df_upto, window=min(100, len(df_upto)))
+        freq100_features = np.array([freq100.get(n, 0) for n in WHITE_NUMBERS], dtype=np.float32)
+
+        return np.concatenate([gap_features, gap_ratio_features, freq_features, freq100_features])
 
     def fit(self, df: pd.DataFrame) -> "KNNPredictor":
         """
