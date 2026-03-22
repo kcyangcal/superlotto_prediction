@@ -7,7 +7,7 @@
 ## 一、專案概覽
 
 **目的**：純學習用的 ML 管線，練習資料工程、爬蟲、特徵工程、ML 建模與評估。
-**資料**：加州 SuperLotto Plus 歷史開獎（2000–2025，約 2,691 期）
+**資料**：加州 SuperLotto Plus 歷史開獎（2000–2025，約 2,691 期；評估用 2020 後 649 期）
 **語言**：Python 3.12，虛擬環境 `.venv`
 **路徑**：`d:\010_Github\superlotto_prediction`
 **DB**：`data/superlotto.db`（SQLite，git 忽略）
@@ -41,6 +41,11 @@ superlotto_prediction/
 ├── docs/
 │   ├── evaluation_pipeline.md   # 評估架構說明（含 EV、per-draw 方法）
 │   └── backend_theory.md        # 所有模型數學原理（12 個模型）
+├── results/                     # ← 評估結果存放（2026-03-21 新增）
+│   ├── rolling_eval_summary.csv              # 12模型×25指標，每次執行自動追加
+│   ├── rolling_150draws_classic_models_2026-03-21.txt  # 10個模型完整輸出
+│   ├── feature_analysis.csv                  # 18個特徵的 PB相關係數排名
+│   └── evaluation_report_2026-03-21.md       # 完整評估報告（特徵+模型+策略）
 ├── src/
 │   ├── scraper/
 │   │   ├── client.py            # HTTP Session + 指數退避重試
@@ -78,7 +83,8 @@ superlotto_prediction/
 │   ├── build_features.py        # 重建特徵表
 │   ├── run_prediction.py        # 輸出所有模型當期預測（含對比表）
 │   ├── run_evaluation.py        # Walk-Forward 評估（per-draw 滾動）
-│   └── run_rolling_nn.py        # 逐期 Rolling 評估（含 MLP/LSTM）
+│   ├── run_rolling_nn.py        # 逐期 Rolling 評估（含所有模型+multi-ticket）
+│   └── feature_analysis.py     # ← 新增：特徵信號 PB 相關係數分析
 ├── tests/
 │   ├── test_parser.py
 │   ├── test_repository.py
@@ -94,132 +100,174 @@ superlotto_prediction/
 
 ## 四、已實作的 12 個模型
 
-| # | 模型              | 檔案                   | 關鍵特色                              |
-|---|-------------------|------------------------|---------------------------------------|
-| 1 | FrequencyBaseline | baseline.py            | 頻率加權排名，所有模型的基準線        |
-| 2 | MonteCarloPredictor | monte_carlo.py       | 10萬次模擬，捕捉號碼共現              |
-| 3 | MarkovPredictor   | markov.py              | 一階轉移機率矩陣（號碼→號碼）         |
-| 4 | BayesianPredictor | bayesian.py            | Gap 作為似然，Beta 先驗               |
-| 5 | KNNPredictor      | knn_model.py           | 94維特徵相似度 k 近鄰                 |
-| 6 | DecisionTreePredictor | decision_tree.py   | MultiOutputClassifier + DT            |
-| 7 | RF + XGBoost      | classifier.py          | 多輸出分類，處理類別不平衡            |
-| 8 | GeneticPredictor  | genetic.py             | 適應度=頻率+共現，300代演化           |
-| 9 | MLPPredictor      | neural_network.py      | PyTorch MLP，94→128→64→47，partial_fit|
-|10 | LSTMPredictor     | neural_network.py      | PyTorch LSTM，seq_len=20，gradient clip|
-|11 | EnsemblePredictor | ensemble.py            | 加權投票（7個子模型）                 |
+| # | 模型 | 檔案 | 特徵輸入 | 關鍵特色 |
+|---|------|------|----------|----------|
+| 1 | FrequencyBaseline | baseline.py | 全史+近期頻率 | 頻率加權排名，所有模型的基準線 |
+| 2 | MonteCarloPredictor | monte_carlo.py | 全史頻率（抽樣權重） | 10萬次模擬，捕捉號碼共現 |
+| 3 | MarkovPredictor | markov.py | 轉移矩陣 47×47 | 一階轉移機率矩陣（號碼→號碼）|
+| 4 | BayesianPredictor | bayesian.py | Gap（距上次出現期數） | Gap 作為似然，Beta 先驗 |
+| 5 | KNNPredictor | knn_model.py | current_gap(47)+freq_30(47)=94維 | 特徵相似度 k 近鄰 |
+| 6 | DecisionTreePredictor | decision_tree.py | current_gap(47)+freq_30(47)=94維 | MultiOutputClassifier + DT |
+| 7 | RF + XGBoost | classifier.py | gap+freq+pattern特徵 94維+ | MultiOutputClassifier，47顆球各一 |
+| 8 | GeneticPredictor | genetic.py | 全史頻率+共現矩陣 | 適應度=頻率+共現，300代演化 |
+| 9 | MLPPredictor | neural_network.py | current_gap(47)+freq_30(47)=94維 | PyTorch MLP，94→128→64→47，partial_fit |
+| 10 | LSTMPredictor | neural_network.py | 94維 × seq_len=20 | PyTorch LSTM，sequence modeling，gradient clip |
+| 11 | EnsemblePredictor | ensemble.py | 7個子模型投票 | 加權投票（frequency/MC/markov/bayesian/KNN/DT/genetic）|
 
-所有模型介面統一：`model.fit(df)` + `model.predict(n_white=5)` → `{"white_balls": [...], "mega_balls": [...]}`
+所有模型介面統一：`model.fit(df)` + `model.predict(n_white=5)` → `{"white_balls": [...], "mega_balls": [...], "proba": {...}}`
+
+> 注意：所有模型的 `predict()` 現在均回傳 `"proba"` 欄位（各球出現機率字典），供 multi-ticket 策略使用。
 
 ---
 
-## 五、評估管線設計
+## 五、現行特徵架構
+
+### 已使用的特徵
+
+| 特徵 | 來源 | 維度 | 使用模型 |
+|------|------|------|----------|
+| `current_gap[n]` | base_stats.py | 47 | KNN, DT, RF, XGB, MLP, LSTM |
+| `freq_window[n]` (30期) | base_stats.py | 47 | KNN, DT, RF, XGB, MLP, LSTM |
+| `白球總和` | pattern_stats.py | 1 | RF, XGB |
+| `奇偶/高低比` | pattern_stats.py | 4 | RF, XGB |
+| `連號對數` | pattern_stats.py | 1 | RF, XGB |
+| `號碼跨度` | pattern_stats.py | 1 | RF, XGB |
+| `全史頻率` | base_stats.py | 47 | Frequency, MC, Bayesian, Genetic |
+| `共現矩陣 47×47` | genetic.py 內建 | 2209 | Genetic, Ensemble(via genetic) |
+| `轉移矩陣 47×47` | markov.py 內建 | 2209 | Markov |
+
+### 特徵信號分析結論（2026-03-21，PB相關係數）
+
+| 特徵 | \|r\| | p 值 | 結論 |
+|------|-------|------|------|
+| `ball_zone`（號碼區間） | 0.0198 | \*\*\* | 唯一顯著，但效果量極小 |
+| `current_gap` | 0.0062 | 0.300 | 不顯著 |
+| `freq_10/30/100` | <0.010 | >0.10 | 不顯著 |
+| `gap_ratio`（超期比） | 0.0033 | 0.580 | 不顯著 |
+| `appeared_last` | 0.0052 | 0.383 | 不顯著 |
+| `last_sum/odd/consec` | 0.0000 | 1.000 | 完全無信號 |
+
+**核心結論**：彩票為真實獨立隨機事件，所有候選特徵 \|r\| < 0.02，特徵工程的改善空間極為有限。
+
+---
+
+## 六、評估管線設計
 
 ### 評估腳本對比
 
-| 腳本                  | 切分方式              | 模型更新頻率     | 適用模型                |
-|-----------------------|-----------------------|------------------|-------------------------|
-| `run_evaluation.py`   | Walk-Forward Fold     | **每期重訓**     | 快速模型（<100ms/期）   |
-| `run_rolling_nn.py`   | 全資料逐期滾動        | partial_fit/重訓 | 含 MLP/LSTM             |
+| 腳本 | 切分方式 | 模型更新頻率 | 適用模型 |
+|------|----------|-------------|---------|
+| `run_evaluation.py` | Walk-Forward Fold（日期） | 每 Fold 重訓一次 | 快速模型 |
+| `run_rolling_nn.py` | 全資料逐期滾動 | 依 MODEL_RETRAIN_DEFAULTS | 所有模型（含NN） |
 
-### 關鍵設計：Per-Draw 滾動（不是 Fold 一次訓練）
+### run_rolling_nn.py 關鍵設計
 
-每個測試期：先用截至上期的全部歷史訓練 → 預測 → 記錄命中 → 把本期加入訓練集 → 下一期。
+**MODEL_RETRAIN_DEFAULTS**（各模型重訓週期）：
+```python
+{"bayesian": 1, "markov": 1, "frequency": 1, "knn": 1, "decision_tree": 1,
+ "rf": 3, "xgb": 3, "ensemble": 30,
+ "montecarlo": 5, "genetic": 10, "mlp": 10, "lstm": 10}
+```
 
-### EV 計算（獎金期望值）
+**Multi-Ticket 策略**（`generate_top_k_tickets()`）：
+- 每期生成最多 5 組候選組合
+- 取機率最高的 12 顆球（n_candidates），枚舉 C(12,5)=792 種組合
+- 依機率分數（sum of proba）排名，回傳 top-K
+- 評估買1到5組的 EV / 淨EV / ROI
 
-獎金表（實際某期 Pari-Mutuel 資料）：
+**自動存 Summary CSV**：每次跑完自動追加到 `results/rolling_eval_summary.csv`
 
-| 命中         | 獎金        |
-|-------------|-------------|
-| 5 + Mega    | $7,000,000  |
-| 5           | $25,241     |
-| 4 + Mega    | $1,402      |
-| 4           | $108        |
-| 3 + Mega    | $61         |
-| 3           | $11         |
-| 2 + Mega    | $12         |
-| 1 + Mega    | $2          |
-| 0 + Mega    | $1          |
+### EV 計算
 
-EV 欄位：`ev_per_draw`、`net_ev_per_draw`（= EV - $1）、`roi_pct`
-
----
-
-## 六、目前狀況（截至 2026-03-20）
-
-### ✅ 已完成
-
-- [x] 資料爬蟲：CA Lottery API + lotterycorner.com 補充（2,691 期）
-- [x] SQLite 資料庫：6 張表，Raw/Derived 分離
-- [x] 特徵工程：Gap、頻率（短/中/長期）、模式特徵
-- [x] 12 個模型全部實作，介面統一
-- [x] Walk-Forward 評估管線（`run_evaluation.py`）
-  - Per-Draw 滾動預測（每期重訓，不是 Fold 一次訓練）
-  - EV 計算（含 Pari-Mutuel 獎金表）
-  - FoldMetrics、t-test 顯著性、跨模型比較表
-- [x] Rolling NN 評估管線（`run_rolling_nn.py`）
-  - 支援 MLP/LSTM partial_fit
-  - EV 追蹤
-  - Concept Drift 移動平均分析
-- [x] 兩份技術文件（`docs/evaluation_pipeline.md`、`docs/backend_theory.md`）
-- [x] Windows cp950 編碼問題修正（用 `PYTHONIOENCODING=utf-8` 執行）
-- [x] PyTorch 2.10.0+cpu 安裝於 .venv (Python 3.12)
-
-### 最新評估結果（2026-03-20，train=18m, test=3m，18 Folds）
-
-| 模型      | Avg Hits | Prec@5  | EV/期   | 淨EV    | p-val |
-|-----------|----------|---------|---------|---------|-------|
-| markov    | 0.583    | 11.66%  | $0.151  | $-0.849 | 0.113 |
-| frequency | 0.570    | 11.41%  | $0.352  | $-0.648 | 0.225 |
-| bayesian  | 0.491    | 9.82%   | $0.104  | $-0.896 | 0.162 |
-| 隨機基準  | 0.532    | 10.64%  | —       | —       |       |
-
-**結論**：所有模型 p > 0.05，未能顯著超越隨機基準，符合彩票設計的理論預期。
+獎金表（實際 Pari-Mutuel）：5+Mega=$7M / 5=$25,241 / 4+Mega=$1,402 / 4=$108 / 3+Mega=$61 / 3=$11 / 2+Mega=$12 / 1+Mega=$2 / 0+Mega=$1
 
 ---
 
-## 七、待完成項目
+## 七、最新評估結果（2026-03-21，150期 Rolling）
 
-### 優先級高
-- [ ] **run_rolling_nn.py 實際執行** — MLP/LSTM 的 rolling 結果尚未跑過，需確認 EV 計算正確
-- [ ] **完整 run_evaluation.py 執行**（含 montecarlo） — 目前只測了 frequency/markov/bayesian，montecarlo 較慢尚未納入
-- [ ] **git commit** — 目前所有新增/修改的檔案尚未提交
+### 命中率排名（隨機基準 Avg Hits = 0.532）
 
-### 優先級中
-- [ ] **Notebook 更新**：`01_data_exploration.ipynb` 和 `02_feature_analysis.ipynb` 尚未補充 EV 視覺化和新模型比較
-- [ ] **README.md 更新**：目前 README 的模型列表和架構圖未反映 12 個模型與評估管線
-- [ ] **RF/XGBoost walk-forward 測試** — 這兩個模型在 walk-forward 中過慢，可考慮每 Fold 訓練一次（非 per-draw）
+| 排名 | 模型 | Avg Hits | vs 隨機 | EV/期 | ROI% |
+|------|------|----------|---------|-------|------|
+| 1 | **XGB** | **0.667** | **+0.135** | $0.184 | -81.6% |
+| 2 | RF | 0.627 | +0.095 | $0.174 | -82.6% |
+| 3 | DecisionTree | 0.607 | +0.075 | $0.171 | -82.9% |
+| 4 | Frequency | 0.587 | +0.055 | $0.140 | -86.0% |
+| 5 | Genetic | 0.587 | +0.055 | $0.085 | -91.5% |
+| 6 | KNN | 0.567 | +0.035 | $0.085 | -91.5% |
+| 7 | Ensemble | 0.567 | +0.035 | $0.083 | -91.8% |
+| 8 | MonteCarlo | 0.560 | +0.028 | $0.060 | -94.0% |
+| 9 | Markov | 0.533 | +0.001 | $0.133 | -86.7% |
+| 10 | MLP | 0.513 | -0.019 | $0.074 | -92.6% |
+| 11 | LSTM | 0.500 | -0.032 | $0.158 | -84.2% |
+| 12 | Bayesian | 0.480 | -0.052 | $0.073 | -92.7% |
 
-### 優先級低
-- [ ] **單元測試補充**：`tests/` 目前只有 `test_parser.py`、`test_repository.py`、`test_features.py`，新模型和評估模組缺乏測試
-- [ ] **超參數調優**：MLP 的 epoch、hidden size；LSTM 的 seq_len、hidden；可用 Optuna 做 HPO
-- [ ] **Sliding Window 對比**：目前只用 Expanding Window，可加 Sliding Window 比較 Concept Drift 效果
-- [ ] **Jackpot EV 模擬**：頭獎為 Pari-Mutuel 滾動累計，實際金額每期不同；可爬取歷史 jackpot 金額做更精確的 EV 回測
+### Multi-Ticket 最佳策略
+
+| 最佳策略 | ROI |
+|---------|-----|
+| **Ensemble 買3組** | -80.6%（所有組合中最低損失）|
+| XGB 買1組 | -81.6%（命中率最高） |
+| LSTM 買5組 | -82.1% |
+
+> **注意**：所有 ROI 均為負值，這是彩票設計的必然結果（賭場優勢）。
+
+### 神經網路 vs 傳統模型
+
+MLP（0.513）和 LSTM（0.500）均低於隨機基準（0.532），在 649 期資料量下出現過擬合。XGB/RF 的優勢可能部分來自小樣本統計噪音，建議以更長時間窗口驗證。
 
 ---
 
-## 八、快速上手命令
+## 八、重要設計決策記錄
+
+| 決策 | 原因 |
+|------|------|
+| Per-Draw 滾動預測 | 比「Fold 訓練一次」更正確，反映真實持續學習場景 |
+| Expanding Window | 保留所有歷史資料（彩票號碼分布相對穩定）|
+| `proba` 統一介面 | 所有模型 predict() 均回傳機率字典，供 multi-ticket 使用 |
+| `pos_weight = 8.4` | 5顆中/42顆未中的類別不平衡補償（分類模型）|
+| Pari-Mutuel 獎金表 | 使用實際某期開獎資料，更接近真實 EV |
+| `PYTHONIOENCODING=utf-8` | Windows cp950 終端無法顯示中文 Unicode |
+| PyTorch CPU-only | 本機無 CUDA GPU，安裝 torch+cpu 節省磁碟 |
+| Gradient Clipping LSTM | 防止梯度爆炸，clip_grad_norm(max_norm=1.0) |
+| ensemble retrain_every=30 | Ensemble 內含 MC+GA，每期重訓成本太高（原來3，改為30）|
+| results/ 自動存 CSV | `save_summary_csv()` 追加模式，方便跨次執行比較 |
+
+---
+
+## 九、快速上手命令
 
 ```bash
-# 確認環境
 cd d:/010_Github/superlotto_prediction
-.venv/Scripts/python -c "import torch, pandas, scipy; print('OK')"
+
+# 確認環境
+PYTHONIOENCODING=utf-8 .venv/Scripts/python -c "import torch, pandas, scipy; print('OK')"
 
 # 執行當期預測（所有模型）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_prediction.py
 
-# Walk-Forward 評估（快速）
+# Rolling 評估（所有模型，150期）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_rolling_nn.py \
+  --test-draws 150 --initial-train 200 \
+  --models frequency,bayesian,markov,montecarlo,knn,decision_tree,genetic,rf,xgb,ensemble \
+  --n-tickets 5 --n-candidates 12
+
+# Rolling 評估（MLP + LSTM）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_rolling_nn.py \
+  --test-draws 150 --models mlp,lstm \
+  --mlp-epochs 100 --lstm-epochs 80
+
+# Rolling 評估（全部12個模型）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_rolling_nn.py \
+  --test-draws 150 --models all
+
+# 特徵信號分析
+PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/feature_analysis.py
+
+# Walk-Forward Fold 評估（快速）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_evaluation.py \
   --train-months 18 --test-months 3 \
   --models frequency,markov,bayesian --show-folds
-
-# Walk-Forward 評估（完整含 MonteCarlo）
-PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_evaluation.py \
-  --models frequency,montecarlo,markov,bayesian
-
-# Rolling NN 評估（快速，跳過 LSTM）
-PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_rolling_nn.py \
-  --test-draws 100 --no-lstm --models mlp,bayesian,markov,frequency
 
 # 增量更新資料（每週執行）
 .venv/Scripts/python scripts/scrape_latest.py
@@ -228,19 +276,35 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python scripts/run_rolling_nn.py \
 
 ---
 
-## 九、重要設計決策記錄
+## 十、可能的下一步
 
-| 決策                       | 原因                                                            |
-|----------------------------|-----------------------------------------------------------------|
-| Per-Draw 滾動預測           | 比「Fold 訓練一次」更正確，反映真實持續學習場景                  |
-| Expanding Window            | 保留所有歷史資料（彩票號碼分布相對穩定）                        |
-| pos_weight = 8.4            | 5顆中/42顆未中的類別不平衡補償（所有分類模型）                   |
-| Pari-Mutuel 獎金表          | 使用實際某期開獎資料而非固定估算值，更接近真實 EV               |
-| PYTHONIOENCODING=utf-8      | Windows cp950 終端無法顯示中文 Unicode，需明確設定輸出編碼      |
-| PyTorch CPU-only in .venv   | 本機無 CUDA GPU，安裝 torch+cpu 版以節省磁碟空間                |
-| Gradient Clipping LSTM      | LSTM 序列訓練容易梯度爆炸，clip_grad_norm(max_norm=1.0) 防止    |
-| lr×0.1 for LSTM fine-tune   | partial_fit 時降低學習率以緩解 Catastrophic Forgetting          |
+### A. 擴大資料量（驗證現有結果是否只是噪音）
+- 把評估資料從 2020 後（649 期）改為 2010 後（~1,600 期）
+- 重跑 150 期 rolling，確認 XGB/RF 優勢是否持續
+
+### B. 延長評估期數（更嚴格的統計檢定）
+- 目前 test-draws=150，樣本量不足以區分模型間差異
+- 改為 test-draws=400，讓 Avg Hits 的標準誤更小
+
+### C. 超參數調優（XGB/RF 基礎上改善）
+- XGB：`n_estimators`、`max_depth`、`learning_rate`
+- RF：`n_estimators`、`min_samples_leaf`
+- 工具：Optuna（貝氏超參數搜索）
+
+### D. 特徵工程迭代（效果有限但值得一試）
+- 加入 `gap_ratio`、`freq_5`、`freq_100` 到 KNN/DT
+- 加入 `ball_zone` bias 修正（唯一顯著特徵）
+- 目標：XGB/RF 從 0.667/0.627 能否再提升？
+
+### E. 生成當期實際預測
+- 用最佳模型（XGB、Ensemble）對下一期開獎做預測
+- 輸出：推薦號碼 + 機率分布 + 多組候選
+
+### F. 視覺化（Notebook 更新）
+- ROI 隨期數的累積曲線
+- 命中數分布直方圖
+- 特徵重要性（XGB feature importance）
 
 ---
 
-*最後更新：2026-03-20*
+*最後更新：2026-03-21*
